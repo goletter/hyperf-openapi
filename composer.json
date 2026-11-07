@@ -2,7 +2,7 @@
     "name": "goletter/hyperf-openapi",
     "description": "Hyperf OpenAPI 3：自动扫描分发 Controller 生成文档，可直接导入 Apifox（无需注解）。",
     "type": "library",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "license": "MIT",
     "authors": [
         {

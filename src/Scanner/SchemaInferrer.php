@@ -296,7 +296,8 @@ final class SchemaInferrer
     }
 
     /**
-     * 从 create_{snake_plural}_table 迁移推断字段。
+     * 从迁移推断字段：合并 create_{table}_table 与后续 alter（如 *_to_{table}_table）。
+     * 按文件名时间序叠加；只解析 up()，避免 down() 里的 dropColumn 冲掉字段。
      *
      * @return array<string, array<string, mixed>>
      */
@@ -311,20 +312,52 @@ final class SchemaInferrer
             return [];
         }
 
-        $files = glob($dir . '/*_create_' . $table . '_table.php') ?: [];
+        // create + rename/alter（add_*_to_{table}_table）等，按时间戳排序后合并
+        $files = array_values(array_unique(array_merge(
+            glob($dir . '/*_create_' . $table . '_table.php') ?: [],
+            glob($dir . '/*_to_' . $table . '_table.php') ?: [],
+            glob($dir . '/*_' . $table . '_table.php') ?: [],
+        )));
         if ($files === []) {
-            $files = glob($dir . '/*_' . $table . '*.php') ?: [];
+            $files = glob($dir . '/*' . $table . '*.php') ?: [];
         }
         if ($files === []) {
             return [];
         }
         sort($files);
-        $code = $this->read((string) end($files));
-        if ($code === null) {
-            return [];
+
+        $properties = [];
+        foreach ($files as $file) {
+            $code = $this->read((string) $file);
+            if ($code === null) {
+                continue;
+            }
+            $upBody = $this->extractMigrationUpBody($code);
+            foreach ($this->parseMigrationColumns($upBody !== '' ? $upBody : $code) as $field => $schema) {
+                if (($schema['_drop'] ?? false) === true) {
+                    unset($properties[$field], $schema['_drop']);
+                    continue;
+                }
+                unset($schema['_drop']);
+                $properties[$field] = $schema;
+            }
         }
 
-        return $this->parseMigrationColumns($code);
+        return $properties;
+    }
+
+    /** 截取 up() 方法体；失败则返回空串由调用方回退整文件。 */
+    private function extractMigrationUpBody(string $code): string
+    {
+        if (! preg_match('/function\s+up\s*\([^)]*\)\s*(?::\s*\??[\w|\\\\]+\s*)?\{/s', $code, $m, PREG_OFFSET_CAPTURE)) {
+            return '';
+        }
+        $start = (int) $m[0][1] + strlen($m[0][0]);
+        if (preg_match('/function\s+down\s*\(/s', $code, $dm, PREG_OFFSET_CAPTURE, $start)) {
+            return substr($code, $start, (int) $dm[0][1] - $start);
+        }
+
+        return substr($code, $start);
     }
 
     /**
@@ -333,7 +366,10 @@ final class SchemaInferrer
     private function parseMigrationColumns(string $code): array
     {
         $properties = [];
-        $skip = ['index', 'unique', 'primary', 'foreign', 'timestamps', 'datetimes', 'softDeletes', 'rememberToken', 'comment'];
+        $skip = [
+            'index', 'unique', 'primary', 'foreign', 'timestamps', 'datetimes',
+            'softDeletes', 'rememberToken', 'comment', 'renameColumn', 'rename',
+        ];
         // 按行解析，避免 comment 文案中的分号截断整句
         foreach (preg_split('/\r\n|\n|\r/', $code) ?: [] as $line) {
             if (! preg_match('/\$table->(\w+)\(\s*[\'"]([\w]+)[\'"]/', $line, $m)) {
@@ -342,6 +378,11 @@ final class SchemaInferrer
             $method = $m[1];
             $field = $m[2];
             if (in_array($method, $skip, true)) {
+                continue;
+            }
+            // up() 里直接 drop 时标记删除，供 fromMigration 合并时 unset
+            if (strcasecmp($method, 'dropColumn') === 0) {
+                $properties[$field] = ['_drop' => true];
                 continue;
             }
             $schema = $this->migrationTypeToSchema($method);
@@ -359,7 +400,95 @@ final class SchemaInferrer
             $properties['updated_at'] ??= ['type' => 'string', 'format' => 'date-time', 'description' => 'updated_at'];
         }
 
+        // Db::statement("ALTER TABLE ... MODIFY/ADD COLUMN ... COMMENT '...'")
+        foreach ($this->parseAlterSqlColumns($code) as $field => $schema) {
+            if (isset($properties[$field])) {
+                if (! empty($schema['description'])) {
+                    $properties[$field]['description'] = $schema['description'];
+                }
+                if (! empty($schema['type'])) {
+                    $properties[$field]['type'] = $schema['type'];
+                }
+                if (! empty($schema['format'])) {
+                    $properties[$field]['format'] = $schema['format'];
+                }
+            } else {
+                $properties[$field] = $schema;
+            }
+        }
+
         return $properties;
+    }
+
+    /**
+     * 解析迁移里原生 SQL：ALTER TABLE ... ADD|MODIFY|CHANGE COLUMN `field` TYPE ... COMMENT '...'.
+     *
+     * @return array<string, array<string, mixed>>
+     */
+    private function parseAlterSqlColumns(string $code): array
+    {
+        $properties = [];
+        $typePart = '(\w+(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?)';
+        $commentPart = '(?:.*?COMMENT\s+[\'"]([^\'"]*)[\'"])?';
+
+        // ADD|MODIFY COLUMN `field` TYPE ... COMMENT '...'
+        if (preg_match_all(
+            '/\b(?:ADD|MODIFY)(?:\s+COLUMN)?\s+[`]?(\w+)[`]?\s+' . $typePart . $commentPart . '/is',
+            $code,
+            $matches,
+            PREG_SET_ORDER
+        )) {
+            foreach ($matches as $row) {
+                $this->mergeAlterColumn($properties, $row[1], $row[2], $row[3] ?? '');
+            }
+        }
+
+        // CHANGE COLUMN `old` `new` TYPE ... COMMENT '...'
+        if (preg_match_all(
+            '/\bCHANGE(?:\s+COLUMN)?\s+[`]?(\w+)[`]?\s+[`]?(\w+)[`]?\s+' . $typePart . $commentPart . '/is',
+            $code,
+            $matches,
+            PREG_SET_ORDER
+        )) {
+            foreach ($matches as $row) {
+                $this->mergeAlterColumn($properties, $row[2], $row[3], $row[4] ?? '');
+            }
+        }
+
+        return $properties;
+    }
+
+    /**
+     * @param array<string, array<string, mixed>> $properties
+     */
+    private function mergeAlterColumn(array &$properties, string $field, string $sqlType, string $comment): void
+    {
+        $field = trim($field);
+        if ($field === '' || in_array(strtolower($field), ['table', 'column', 'if', 'not', 'exists'], true)) {
+            return;
+        }
+        $schema = $this->sqlTypeToSchema(strtolower((string) preg_replace('/\s+/', '', $sqlType)));
+        $comment = trim($comment);
+        $schema['description'] = $comment !== '' ? $comment : $field;
+        $properties[$field] = $schema;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function sqlTypeToSchema(string $sqlType): array
+    {
+        $base = strtolower((string) preg_replace('/\(.*\)$/', '', $sqlType));
+
+        return match ($base) {
+            'tinyint', 'smallint', 'mediumint', 'int', 'integer', 'bigint' => ['type' => 'integer'],
+            'bool', 'boolean' => ['type' => 'boolean'],
+            'float', 'double', 'decimal', 'numeric' => ['type' => 'number'],
+            'json', 'jsonb' => ['type' => 'object'],
+            'date' => ['type' => 'string', 'format' => 'date'],
+            'datetime', 'timestamp' => ['type' => 'string', 'format' => 'date-time'],
+            default => ['type' => 'string'],
+        };
     }
 
     /**
