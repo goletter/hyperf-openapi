@@ -9,7 +9,8 @@ use Hyperf\Stringable\Str;
 /**
  * 扫描分发式 Controller：
  * - 类/方法注释 → summary、description、tag
- * - Request::rules/attributes → requestBody
+ * - Request::rules/attributes → query / requestBody（优先；不用 DB 补请求参数）
+ * - 无 FormRequest 的列表 → ModelFilter query
  * - Resource（+ Model）→ 响应 data
  */
 final class DispatcherControllerScanner
@@ -661,7 +662,12 @@ final class DispatcherControllerScanner
         $requestBody = null;
         $requestSchema = null;
         if ($formRequestShort !== null) {
-            $requestFile = $this->resolveRequestFile($class, $formRequestShort);
+            $requestFile = $this->resolveRequestFile(
+                $class,
+                $formRequestShort,
+                (string) ($meta['resource'] ?? ''),
+                (string) ($meta['file'] ?? '')
+            );
             if ($requestFile !== null) {
                 $requestSchema = $this->schemas->fromRequestFile($requestFile);
             }
@@ -679,7 +685,7 @@ final class DispatcherControllerScanner
             // 约定：AccountDemandController → AccountDemandResource
             $resourceShort = $meta['resource'] . 'Resource';
         }
-        $resourceFile = $this->resolveResourceFile($class, $resourceShort);
+        $resourceFile = $this->resolveResourceFile($class, $resourceShort, (string) ($meta['file'] ?? ''));
         if ($resourceFile !== null) {
             $fqcn = $this->fqcnFromAppFile($resourceFile)
                 ?? (str_contains($resourceShort, '\\')
@@ -690,12 +696,17 @@ final class DispatcherControllerScanner
             $resourceIncludes = $resourceSchema['includes'];
         }
 
-        // GET 列表：先业务筛选，page / pageSize / include 统一放参数末尾
+        // GET 列表：有 FormRequest 时只用 Request；否则回落 ModelFilter。page/pageSize/include 放末尾
         if ($http === 'get' && ($isCollection || $name === 'index')) {
-            $filterFile = $this->resolveFilterFile($resourceName);
-            $filterSchema = $this->schemas->fromFilterFile($filterFile ?? '', false);
-            $queryProperties = array_merge($filterSchema['properties'], $requestSchema['properties'] ?? []);
-            $queryRequired = $requestSchema['required'] ?? [];
+            if ($requestSchema !== null) {
+                $queryProperties = $requestSchema['properties'];
+                $queryRequired = $requestSchema['required'];
+            } else {
+                $filterFile = $this->resolveFilterFile($resourceName);
+                $filterSchema = $this->schemas->fromFilterFile($filterFile ?? '', false);
+                $queryProperties = $filterSchema['properties'];
+                $queryRequired = [];
+            }
             foreach ($queryProperties as $field => $prop) {
                 if (in_array($field, ['page', 'pageSize', 'include'], true)) {
                     continue;
@@ -738,7 +749,7 @@ final class DispatcherControllerScanner
         }
 
         if (in_array($http, ['post', 'put', 'patch'], true)) {
-            $bodySchema = $this->schemas->forWriteBody($requestSchema, $resourceName);
+            $bodySchema = $this->schemas->forWriteBody($requestSchema);
             if ($bodySchema['properties'] !== []) {
                 $schema = [
                     'type' => 'object',
@@ -898,9 +909,35 @@ final class DispatcherControllerScanner
         return $ns . '\\' . $name;
     }
 
-    private function resolveRequestFile(string $controllerClass, string $short): ?string
-    {
-        return $this->resolveVersionedAppFile($controllerClass, $short, 'Request');
+    /**
+     * 解析 FormRequest 文件：优先 use/FQCN，再试扁平与 {Resource}/ 子目录，最后递归搜索。
+     */
+    private function resolveRequestFile(
+        string $controllerClass,
+        string $short,
+        string $resource = '',
+        string $controllerFile = ''
+    ): ?string {
+        $short = ltrim($short, '\\');
+
+        // Controller use 语句 → FQCN（如 App\Request\Api\V1\Account\StoreAccountRequest）
+        if ($controllerFile !== '' && ! str_contains($short, '\\')) {
+            $imported = $this->resolveImportFqcn($controllerFile, $short);
+            if ($imported !== null) {
+                $file = $this->appFileFromFqcn($imported);
+                if ($file !== null && is_file($file)) {
+                    return $file;
+                }
+            }
+        }
+
+        $file = $this->resolveVersionedAppFile($controllerClass, $short, 'Request', $resource);
+        if ($file !== null) {
+            return $file;
+        }
+
+        // 兜底：在对应版本 Request 目录下按类名递归查找
+        return $this->findAppFileByBasename($controllerClass, $short, 'Request');
     }
 
     private function resolveFilterFile(string $resource): ?string
@@ -913,16 +950,62 @@ final class DispatcherControllerScanner
         return is_file($file) ? $file : null;
     }
 
-    private function resolveResourceFile(string $controllerClass, string $short): ?string
+    private function resolveResourceFile(
+        string $controllerClass,
+        string $short,
+        string $controllerFile = ''
+    ): ?string {
+        $short = ltrim($short, '\\');
+
+        if ($controllerFile !== '' && ! str_contains($short, '\\')) {
+            $imported = $this->resolveImportFqcn($controllerFile, $short);
+            if ($imported !== null) {
+                $file = $this->appFileFromFqcn($imported);
+                if ($file !== null && is_file($file)) {
+                    return $file;
+                }
+            }
+        }
+
+        $file = $this->resolveVersionedAppFile($controllerClass, $short, 'Resource');
+        if ($file !== null) {
+            return $file;
+        }
+
+        return $this->findAppFileByBasename($controllerClass, $short, 'Resource');
+    }
+
+
+    /**
+     * 从 Controller 源码 use 语句解析短类名对应的 FQCN。
+     */
+    private function resolveImportFqcn(string $controllerFile, string $short): ?string
     {
-        return $this->resolveVersionedAppFile($controllerClass, $short, 'Resource');
+        if ($short === '' || ! is_file($controllerFile)) {
+            return null;
+        }
+        $code = (string) file_get_contents($controllerFile);
+        $quoted = preg_quote($short, '/');
+        if (preg_match('/\buse\s+([A-Za-z_\\\\]+\\\\' . $quoted . ')\s*;/', $code, $m)) {
+            return ltrim($m[1], '\\');
+        }
+        if (preg_match('/\buse\s+([A-Za-z_\\\\]+)\s+as\s+' . $quoted . '\s*;/', $code, $m)) {
+            return ltrim($m[1], '\\');
+        }
+
+        return null;
     }
 
     /**
      * 按 Controller 命名空间解析 Request/Resource；Vn 不存在时回退到 V(n-1)…V1。
+     * Request 额外尝试 {Resource}/ 子目录（如 Request/Api/V1/Account/StoreAccountRequest.php）。
      */
-    private function resolveVersionedAppFile(string $controllerClass, string $short, string $segment): ?string
-    {
+    private function resolveVersionedAppFile(
+        string $controllerClass,
+        string $short,
+        string $segment,
+        string $resource = ''
+    ): ?string {
         $short = ltrim($short, '\\');
         $base = str_contains($short, '\\') ? substr($short, strrpos($short, '\\') + 1) : $short;
         $ns = substr($controllerClass, 0, (int) strrpos($controllerClass, '\\'));
@@ -936,9 +1019,18 @@ final class DispatcherControllerScanner
 
         foreach ($namespaces as $ctrlNs) {
             $targetNs = str_replace('\\Controller\\', '\\' . $segment . '\\', $ctrlNs);
-            $file = BASE_PATH . '/app/' . substr(str_replace('\\', '/', $targetNs), 4) . '/' . $base . '.php';
-            if (is_file($file)) {
-                return $file;
+            $dir = BASE_PATH . '/app/' . substr(str_replace('\\', '/', $targetNs), 4);
+
+            $candidates = [$dir . '/' . $base . '.php'];
+            // Request/Resource 常见布局：{Vn}/{Resource}/{Class}.php
+            if ($resource !== '' && in_array($segment, ['Request', 'Resource'], true)) {
+                $candidates[] = $dir . '/' . $resource . '/' . $base . '.php';
+            }
+
+            foreach ($candidates as $file) {
+                if (is_file($file)) {
+                    return $file;
+                }
             }
         }
 
@@ -947,6 +1039,37 @@ final class DispatcherControllerScanner
             $file = $this->appFileFromFqcn($short);
 
             return $file !== null && is_file($file) ? $file : null;
+        }
+
+        return null;
+    }
+
+    /**
+     * 在 App\{Request|Resource}\...\Vn 下按文件名递归查找。
+     */
+    private function findAppFileByBasename(string $controllerClass, string $short, string $segment): ?string
+    {
+        if (! defined('BASE_PATH') || $short === '' || str_contains($short, '\\')) {
+            return null;
+        }
+        $ns = substr($controllerClass, 0, (int) strrpos($controllerClass, '\\'));
+        $targetNs = str_replace('\\Controller\\', '\\' . $segment . '\\', $ns);
+        $dir = BASE_PATH . '/app/' . substr(str_replace('\\', '/', $targetNs), 4);
+        if (! is_dir($dir)) {
+            return null;
+        }
+
+        $needle = $short . '.php';
+        $iterator = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS)
+        );
+        foreach ($iterator as $fileInfo) {
+            if (! $fileInfo instanceof \SplFileInfo || ! $fileInfo->isFile()) {
+                continue;
+            }
+            if ($fileInfo->getFilename() === $needle) {
+                return $fileInfo->getPathname();
+            }
         }
 
         return null;
