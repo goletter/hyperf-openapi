@@ -4,20 +4,26 @@ declare(strict_types=1);
 
 use function Hyperf\Support\env;
 
+$apiDispatcherFile = __DIR__ . '/api_dispatcher.php';
+$apiDispatcher = is_file($apiDispatcherFile) ? require $apiDispatcherFile : [];
+
 /**
  * goletter/hyperf-openapi — 按 API 版本分别生成，可导入 Apifox。
  *
  *   php bin/hyperf.php openapi:generate
  *   php bin/hyperf.php openapi:generate --api-version=v1
+ *
+ * versions 优先引用同目录 api_dispatcher.php（goletter/hyperf-server 发布）；
+ * 若尚未发布 api_dispatcher，则回退为空数组（生成时再读 config 或扫 Vn 目录）。
  */
 return [
     'enable' => (bool) env('OPENAPI_ENABLE', true),
 
     /**
-     * 要生成的版本；空数组则回退 api_dispatcher.versions，再否则自动扫描 Vn 目录。
-     * 推荐与 config/autoload/api_dispatcher.php 共用同一份 versions（require 引用）。
+     * 与 api_dispatcher.versions 同源；勿在此单独维护列表。
+     * 空数组时 OpenApiGenerator 仍会回退 config('api_dispatcher.versions')，再否则扫 Vn。
      */
-    'versions' => ['v3', 'v2', 'v1'],
+    'versions' => $apiDispatcher['versions'] ?? [],
 
     /**
      * folder：Apifox 二级目录名（最终 = {version}/{folder}/{模块名}，如 v1/Api/需求管理）。

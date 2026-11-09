@@ -53,7 +53,9 @@ storage/openapi/index.json
 `config/autoload/openapi.php`：
 
 ```php
-'versions' => ['v3', 'v2', 'v1'], // 空=自动扫 Vn 目录
+// 推荐与 goletter/hyperf-server 的 api_dispatcher.php 共用版本列表：
+$apiDispatcher = is_file(__DIR__ . '/api_dispatcher.php') ? require __DIR__ . '/api_dispatcher.php' : [];
+'versions' => $apiDispatcher['versions'] ?? [], // 空则回退 api_dispatcher.versions / 扫 Vn
 
 'gateways' => [
     [
