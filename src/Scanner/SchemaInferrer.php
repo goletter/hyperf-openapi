@@ -12,7 +12,8 @@ use Hyperf\Stringable\Str;
 final class SchemaInferrer
 {
     /**
-     * 解析 FormRequest：rules + attributes → properties / required / descriptions.
+     * 解析 FormRequest：rules + attributes → properties / required / descriptions。
+     * rules 为空时仍返回空结构，便于区分「已定位 Request」与「未找到文件」。
      *
      * @return array{properties: array<string, array<string, mixed>>, required: list<string>}|null
      */
@@ -25,9 +26,6 @@ final class SchemaInferrer
 
         $rules = $this->parseStringArrayMethod($code, 'rules');
         $attributes = $this->parseStringArrayMethod($code, 'attributes');
-        if ($rules === []) {
-            return null;
-        }
 
         $properties = [];
         $required = [];
@@ -49,38 +47,21 @@ final class SchemaInferrer
         ];
     }
 
+
     /**
-     * 写接口 body：Request rules 优先，不足时用 migration 字段补全（便于 Apifox 调试填参）。
+     * 写接口 body：仅使用 FormRequest::rules()/attributes()，不用 migration/数据库补全。
      *
      * @param array{properties: array<string, array<string, mixed>>, required: list<string>}|null $requestSchema
      * @return array{properties: array<string, array<string, mixed>>, required: list<string>}
      */
-    public function forWriteBody(?array $requestSchema, string $modelBase): array
+    public function forWriteBody(?array $requestSchema): array
     {
-        $properties = $requestSchema['properties'] ?? [];
-        $required = $requestSchema['required'] ?? [];
-
-        $migration = $modelBase !== '' ? $this->fromMigration($modelBase) : [];
-        $skip = ['id', 'created_at', 'updated_at', 'deleted_at'];
-        foreach ($migration as $field => $schema) {
-            if (in_array($field, $skip, true)) {
-                continue;
-            }
-            if (! isset($properties[$field])) {
-                $properties[$field] = $schema;
-            } elseif (empty($properties[$field]['description']) || ($properties[$field]['description'] ?? '') === $field) {
-                if (! empty($schema['description'])) {
-                    $properties[$field]['description'] = $schema['description'];
-                    $properties[$field]['title'] = $schema['description'];
-                }
-            }
-        }
-
         return [
-            'properties' => $properties,
-            'required' => array_values(array_unique($required)),
+            'properties' => $requestSchema['properties'] ?? [],
+            'required' => array_values(array_unique($requestSchema['required'] ?? [])),
         ];
     }
+
 
     /**
      * ModelFilter 公开方法 → query 参数（snake_case）；可选附带分页 page/pageSize。
@@ -558,28 +539,43 @@ final class SchemaInferrer
     private function parseAssocArrayBody(string $body): array
     {
         $result = [];
-        if (! preg_match_all(
+
+        // 'field' => 'required|string|max:100'
+        if (preg_match_all(
             "/['\"]([A-Za-z0-9_.]+)['\"]\s*=>\s*['\"]([^'\"]*)['\"]/",
             $body,
             $matches,
             PREG_SET_ORDER
         )) {
-            // 也支持 'field' => ['required', 'string'] 简化成字段名
-            if (preg_match_all("/['\"]([A-Za-z0-9_.]+)['\"]\s*=>/", $body, $keys)) {
-                foreach ($keys[1] as $field) {
-                    $result[$field] = 'string';
-                }
+            foreach ($matches as $row) {
+                $result[$row[1]] = $row[2];
             }
-
-            return $result;
         }
 
-        foreach ($matches as $row) {
-            $result[$row[1]] = $row[2];
+        // 'field' => ['required', 'string', 'max:100']
+        if (preg_match_all(
+            "/['\"]([A-Za-z0-9_.]+)['\"]\s*=>\s*\[(.*?)\]/s",
+            $body,
+            $matches,
+            PREG_SET_ORDER
+        )) {
+            foreach ($matches as $row) {
+                $field = $row[1];
+                if (isset($result[$field])) {
+                    continue;
+                }
+                $parts = [];
+                if (preg_match_all("/['\"]([^'\"]+)['\"]/", $row[2], $items)) {
+                    $parts = $items[1];
+                }
+                $result[$field] = $parts !== [] ? implode('|', $parts) : 'string';
+            }
         }
 
         return $result;
     }
+
+
 
     /**
      * @return array<string, array<string, mixed>>
@@ -807,16 +803,16 @@ final class SchemaInferrer
         return is_file($file) ? $file : null;
     }
 
-    /**
-     * @return array<string, mixed>
-     */
     private function ruleToSchema(string $rules): array
     {
         $parts = array_map('trim', explode('|', strtolower($rules)));
         $schema = ['type' => 'string'];
+        $nullable = false;
 
         foreach ($parts as $part) {
-            if ($part === 'integer' || $part === 'int') {
+            if ($part === 'nullable') {
+                $nullable = true;
+            } elseif ($part === 'integer' || $part === 'int') {
                 $schema['type'] = 'integer';
             } elseif ($part === 'numeric') {
                 $schema['type'] = 'number';
@@ -825,9 +821,43 @@ final class SchemaInferrer
             } elseif ($part === 'array') {
                 $schema['type'] = 'array';
                 $schema['items'] = ['type' => 'string'];
+            } elseif ($part === 'json') {
+                $schema['type'] = 'object';
             } elseif ($part === 'email') {
                 $schema['type'] = 'string';
                 $schema['format'] = 'email';
+            } elseif ($part === 'url' || $part === 'active_url') {
+                $schema['type'] = 'string';
+                $schema['format'] = 'uri';
+            } elseif ($part === 'uuid') {
+                $schema['type'] = 'string';
+                $schema['format'] = 'uuid';
+            } elseif ($part === 'date') {
+                $schema['type'] = 'string';
+                $schema['format'] = 'date';
+            } elseif ($part === 'datetime' || str_starts_with($part, 'date_format:')) {
+                $schema['type'] = 'string';
+                $schema['format'] = 'date-time';
+            } elseif (str_starts_with($part, 'in:')) {
+                $enum = array_values(array_filter(
+                    array_map('trim', explode(',', substr($part, 3))),
+                    static fn ($v) => $v !== ''
+                ));
+                if ($enum !== []) {
+                    $schema['enum'] = array_map(
+                        static function (string $v) {
+                            if (is_numeric($v) && ! str_contains($v, '.')) {
+                                return (int) $v;
+                            }
+                            if (is_numeric($v)) {
+                                return (float) $v;
+                            }
+
+                            return $v;
+                        },
+                        $enum
+                    );
+                }
             } elseif (str_starts_with($part, 'max:')) {
                 $n = (int) substr($part, 4);
                 if (($schema['type'] ?? '') === 'string') {
@@ -845,8 +875,13 @@ final class SchemaInferrer
             }
         }
 
+        if ($nullable) {
+            $schema['nullable'] = true;
+        }
+
         return $schema;
     }
+
 
     private function read(string $file): ?string
     {

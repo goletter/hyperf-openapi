@@ -93,21 +93,41 @@ $apiDispatcher = is_file(__DIR__ . '/api_dispatcher.php') ? require __DIR__ . '/
 |------|------|
 | Controller 类注释 | Tag 名（如「需求管理」）、模块说明 |
 | 方法注释 | `summary`；`@param XxxRequest` / `@return` |
-| `Request::rules()` + `attributes()` | 请求体字段、中文说明、必填 |
+| `Request::rules()` + `attributes()` | **请求参数 / requestBody 唯一来源**（不再用数据库/migration 补全） |
 | 方法里 `XxxResource::class` | 响应 `data` 结构 |
 | Resource 空时回落同名 Model `$fillable`/`$casts` | 响应字段 |
+| 无 FormRequest 的列表 | 回落 `Model/Filters/{Resource}Filter` 作 query；有 FormRequest 则只用 Request |
 | 统一信封 | `success/status/code/message/data`；列表默认顶层 `total`（对齐 `ResponseFormatMiddleware`） |
+
+### Request 目录约定
+
+支持扁平与按资源分子目录；解析顺序：
+
+1. Controller `use` 导入的 FQCN  
+2. `app/Request/{Api|Admin}/V{n}/{Class}.php`  
+3. `app/Request/{Api|Admin}/V{n}/{Resource}/{Class}.php`  
+4. 对应版本目录下按类名递归查找  
+
+```
+app/Request/Api/V1/Account/StoreAccountRequest.php
+app/Request/Api/V1/AccountDemand/StoreAccountDemandRequest.php
+```
 
 示例：
 
 ```php
+use App\Request\Api\V1\AccountDemand\StoreAccountDemandRequest;
+use App\Resource\Api\V1\AccountDemandResource;
+
 /**
  * 需求管理 接口
  */
 class AccountDemandController {
     /** 需求添加 */
-    public function store(AccountDemandRequest $request): Resource {
+    public function store(StoreAccountDemandRequest $request): Resource {
         return $this->success($data, AccountDemandResource::class);
     }
 }
 ```
+
+`rules()` 为空则不生成 body/query 业务字段；请在 Request 中补全校验与 `attributes()` 中文说明。
