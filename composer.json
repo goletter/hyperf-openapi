@@ -2,7 +2,7 @@
     "name": "goletter/hyperf-openapi",
     "description": "Hyperf OpenAPI 3\uff1a\u81ea\u52a8\u626b\u63cf\u5206\u53d1 Controller \u751f\u6210\u6587\u6863\uff0c\u53ef\u76f4\u63a5\u5bfc\u5165 Apifox\uff08\u65e0\u9700\u6ce8\u89e3\uff09\u3002",
     "type": "library",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "license": "MIT",
     "authors": [
         {

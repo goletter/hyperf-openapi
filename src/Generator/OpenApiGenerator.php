@@ -203,9 +203,10 @@ final class OpenApiGenerator
     }
 
     /**
-     * 合并各版本文档 → openapi.json，目录为 {version}/{folder}。
-     * 多版本共用真实 path（靠 X-API-Version 区分）时，合并文件用 /{version}{path}
-     * 避免 OpenAPI path+method 互相覆盖；Apifox 调试请带对应版本头，或改回真实 path。
+     * 合并各版本文档 → openapi.json，目录为 {version}/{folder}/{模块}。
+     * 真实请求 path 不含版本（/api/account_demands）；多版本同 path+method 时
+     * OpenAPI 不能重复 key，故导出为 `/api/account_demands#v1`（# 后为版本锚点，
+     * HTTP 不会把 fragment 发给服务端）。单版本文档 openapi.v1.json 仍是纯真实 path。
      *
      * @param array<string, array<string, mixed>> $docs
      */
@@ -217,24 +218,51 @@ final class OpenApiGenerator
 
         $mergedPaths = [];
         $tags = [];
+        $mergedParameters = [];
+        $mergedSecuritySchemes = [];
+        $mergedSecurity = [];
         $multiVersion = count($docs) > 1;
         foreach ($docs as $ver => $doc) {
+            $ver = (string) $ver;
+            $docParams = (array) (($doc['components']['parameters'] ?? []) ?: []);
+            foreach ($docParams as $paramName => $paramDef) {
+                if (! is_string($paramName) || ! is_array($paramDef)) {
+                    continue;
+                }
+                // 多版本时 X-API-Version 各文件 enum 不同，拆成独立 component
+                if ($multiVersion && $paramName === 'X-API-Version') {
+                    $mergedParameters['X-API-Version.' . $ver] = $paramDef;
+                } elseif (! isset($mergedParameters[$paramName])) {
+                    $mergedParameters[$paramName] = $paramDef;
+                }
+            }
+            foreach ((array) (($doc['components']['securitySchemes'] ?? []) ?: []) as $schemeName => $schemeDef) {
+                if (is_string($schemeName) && is_array($schemeDef) && ! isset($mergedSecuritySchemes[$schemeName])) {
+                    $mergedSecuritySchemes[$schemeName] = $schemeDef;
+                }
+            }
+            if ($mergedSecurity === [] && ! empty($doc['security']) && is_array($doc['security'])) {
+                $mergedSecurity = $doc['security'];
+            }
+
             foreach ((array) ($doc['paths'] ?? []) as $path => $methods) {
                 if (! is_array($methods)) {
                     continue;
                 }
+                // 多版本：path#v1 保证 v1/v2 目录都保留，且请求 path 仍是 # 前的真实地址
+                $exportPath = $multiVersion
+                    ? ((string) $path . '#' . $ver)
+                    : (string) $path;
                 foreach ($methods as $method => $operation) {
                     if (! is_array($operation)) {
                         continue;
                     }
-                    // 多版本合并：路径加 /v1 前缀，保证 v1/Api 与 v2/Api 都能保留
-                    $exportPath = $multiVersion
-                        ? ('/' . $ver . (str_starts_with((string) $path, '/') ? $path : '/' . $path))
-                        : (string) $path;
-                    $operation['description'] = trim(
-                        (string) ($operation['description'] ?? '')
-                        . ($multiVersion ? "\n实际请求路径：{$path}（Header: X-API-Version={$ver}）" : '')
-                    );
+                    if ($multiVersion) {
+                        $operation['parameters'] = $this->rewriteApiVersionParameterRefs(
+                            (array) ($operation['parameters'] ?? []),
+                            $ver
+                        );
+                    }
                     $mergedPaths[$exportPath][$method] = $operation;
                     foreach ((array) ($operation['tags'] ?? []) as $tag) {
                         if (is_string($tag) && $tag !== '') {
@@ -255,17 +283,24 @@ final class OpenApiGenerator
             'info' => [
                 'title' => (string) ($this->config->get('openapi.info.title') ?? 'Goletter API'),
                 'version' => 'all',
-                'description' => '目录：v1/Api、v1/Admin、v2/…；合并文档 path 带版本前缀，真实调用见各 operation 说明',
+                'description' => (string) ($this->config->get('openapi.info.description') ?? '按版本自动扫描 Controller，可导入 Apifox'),
             ],
             'servers' => $first['servers'] ?? $this->resolveServers(),
             'tags' => array_values($tags),
             'paths' => $mergedPaths,
         ];
-        if (! empty($first['components'])) {
-            $combined['components'] = $first['components'];
+        $components = [];
+        if ($mergedParameters !== []) {
+            $components['parameters'] = $mergedParameters;
         }
-        if (! empty($first['security'])) {
-            $combined['security'] = $first['security'];
+        if ($mergedSecuritySchemes !== []) {
+            $components['securitySchemes'] = $mergedSecuritySchemes;
+        }
+        if ($components !== []) {
+            $combined['components'] = $components;
+        }
+        if ($mergedSecurity !== []) {
+            $combined['security'] = $mergedSecurity;
         }
 
         $dir = (string) $this->config->get('openapi.output.dir', BASE_PATH . '/storage/openapi');
@@ -421,6 +456,9 @@ final class OpenApiGenerator
      */
     private function buildDocument(array $operations, ?string $version): array
     {
+        $commonParams = $this->buildCommonHeaderComponents($version);
+        $commonRefs = $this->commonHeaderParameterRefs(array_keys($commonParams));
+
         $paths = [];
         foreach ($operations as $op) {
             $path = (string) $op['path'];
@@ -431,7 +469,10 @@ final class OpenApiGenerator
                 'summary' => $op['summary'],
                 'description' => $op['description'],
                 'operationId' => $op['operationId'],
-                'parameters' => $op['parameters'],
+                'parameters' => array_merge(
+                    $commonRefs,
+                    $this->stripDuplicateCommonHeaders((array) ($op['parameters'] ?? []), array_keys($commonParams))
+                ),
             ];
             // Apifox 目录：v1/Api、v1/Admin（优先于 tags）
             if (! empty($op['x-apifox-folder'])) {
@@ -466,9 +507,16 @@ final class OpenApiGenerator
             'paths' => $paths ?: new \stdClass(),
         ];
 
+        $components = [];
+        if ($commonParams !== []) {
+            $components['parameters'] = $commonParams;
+        }
         $schemes = (array) $this->config->get('openapi.security_schemes', []);
         if ($schemes !== []) {
-            $doc['components'] = ['securitySchemes' => $schemes];
+            $components['securitySchemes'] = $schemes;
+        }
+        if ($components !== []) {
+            $doc['components'] = $components;
         }
         $security = (array) $this->config->get('openapi.security', []);
         if ($security !== []) {
@@ -476,6 +524,128 @@ final class OpenApiGenerator
         }
 
         return $doc;
+    }
+
+    /**
+     * common_headers → components.parameters；分版本文档将 X-API-Version 写死为当前版本。
+     *
+     * @return array<string, array<string, mixed>>
+     */
+    private function buildCommonHeaderComponents(?string $version): array
+    {
+        $headers = (array) $this->config->get('openapi.common_headers', []);
+        if ($headers === []) {
+            return [];
+        }
+
+        $parameters = [];
+        foreach ($headers as $name => $meta) {
+            if (! is_string($name) || $name === '' || ! is_array($meta)) {
+                continue;
+            }
+            $type = (string) ($meta['type'] ?? 'string');
+            if ($type === '') {
+                $type = 'string';
+            }
+            $schema = ['type' => $type];
+            $description = (string) ($meta['description'] ?? '');
+
+            if ($name === 'X-API-Version' && $version !== null && $version !== '') {
+                $schema['enum'] = [$version];
+                $schema['default'] = $version;
+                $schema['example'] = $version;
+                $description = $description !== ''
+                    ? $description
+                    : sprintf('API 版本（本文件固定为 %s）', $version);
+            } elseif (isset($meta['example'])) {
+                $schema['example'] = $meta['example'];
+            }
+
+            $parameters[$name] = [
+                'name' => $name,
+                'in' => 'header',
+                'required' => (bool) ($meta['required'] ?? false),
+                'description' => $description,
+                'schema' => $schema,
+            ];
+        }
+
+        return $parameters;
+    }
+
+    /**
+     * @param list<string> $names
+     * @return list<array{$ref: string}>
+     */
+    private function commonHeaderParameterRefs(array $names): array
+    {
+        $refs = [];
+        foreach ($names as $name) {
+            if (! is_string($name) || $name === '') {
+                continue;
+            }
+            $refs[] = ['$ref' => '#/components/parameters/' . $name];
+        }
+
+        return $refs;
+    }
+
+    /**
+     * @param list<array<string, mixed>> $parameters
+     * @param list<string> $commonNames
+     * @return list<array<string, mixed>>
+     */
+    private function stripDuplicateCommonHeaders(array $parameters, array $commonNames): array
+    {
+        if ($commonNames === []) {
+            return $parameters;
+        }
+        $set = array_fill_keys($commonNames, true);
+        $out = [];
+        foreach ($parameters as $param) {
+            if (! is_array($param)) {
+                continue;
+            }
+            if (isset($param['$ref']) && is_string($param['$ref'])) {
+                foreach ($commonNames as $name) {
+                    if ($param['$ref'] === '#/components/parameters/' . $name) {
+                        continue 2;
+                    }
+                }
+            }
+            $name = (string) ($param['name'] ?? '');
+            $in = (string) ($param['in'] ?? '');
+            if ($name !== '' && $in === 'header' && isset($set[$name])) {
+                continue;
+            }
+            $out[] = $param;
+        }
+
+        return $out;
+    }
+
+    /**
+     * 合并多版本文档时，将 X-API-Version $ref 改写为带版本后缀的 component。
+     *
+     * @param list<array<string, mixed>> $parameters
+     * @return list<array<string, mixed>>
+     */
+    private function rewriteApiVersionParameterRefs(array $parameters, string $version): array
+    {
+        $from = '#/components/parameters/X-API-Version';
+        $to = '#/components/parameters/X-API-Version.' . $version;
+        $out = [];
+        foreach ($parameters as $param) {
+            if (! is_array($param)) {
+                continue;
+            }
+            if (($param['$ref'] ?? null) === $from) {
+                $param['$ref'] = $to;
+            }
+            $out[] = $param;
+        }
+
+        return $out;
     }
 
     /**
