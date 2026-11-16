@@ -131,3 +131,26 @@ class AccountDemandController {
 ```
 
 `rules()` 为空则不生成 body/query 业务字段；请在 Request 中补全校验与 `attributes()` 中文说明。
+
+### 嵌套 / 数组通配规则
+
+支持 Laravel/Hyperf 风格路径，并折叠进 OpenAPI schema：
+
+| rules 键 | 生成结果 |
+|----------|----------|
+| `items` + `array` | `type: array` |
+| `items.*.name` | `items.items.properties.name` |
+| `profile.city` | `profile.properties.city` |
+
+```php
+public function rules(): array
+{
+    return [
+        'items' => 'required|array|min:1',
+        'items.*.name' => 'required|string|max:100',
+        'items.*.money' => 'required|integer|min:1',
+    ];
+}
+```
+
+`attributes()` 中的 `items.*.name` 会写入对应字段的 `description` / `title`，便于 Apifox 展示中文名。

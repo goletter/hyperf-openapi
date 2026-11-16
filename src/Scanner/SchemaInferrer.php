@@ -27,24 +27,160 @@ final class SchemaInferrer
         $rules = $this->parseStringArrayMethod($code, 'rules');
         $attributes = $this->parseStringArrayMethod($code, 'attributes');
 
-        $properties = [];
-        $required = [];
+        $flat = [];
+        $requiredMap = [];
         foreach ($rules as $field => $rule) {
             $schema = $this->ruleToSchema($rule);
             if (isset($attributes[$field]) && $attributes[$field] !== '') {
                 $schema['description'] = $attributes[$field];
                 $schema['title'] = $attributes[$field];
             }
-            $properties[$field] = $schema;
+            $flat[$field] = $schema;
             if (preg_match('/(?<![a-z])required(?![a-z])/', strtolower($rule))) {
-                $required[] = $field;
+                $requiredMap[$field] = true;
             }
         }
 
+        return $this->nestRuleProperties($flat, $requiredMap);
+    }
+
+    /**
+     * 将 rules 路径折成 OpenAPI 嵌套结构。
+     * items.*.name → items.items.properties.name；profile.city → profile.properties.city。
+     *
+     * @param array<string, array<string, mixed>> $flat
+     * @param array<string, true> $requiredMap
+     * @return array{properties: array<string, array<string, mixed>>, required: list<string>}
+     */
+    private function nestRuleProperties(array $flat, array $requiredMap): array
+    {
+        $root = $this->emptyRuleNode();
+        foreach ($flat as $field => $schema) {
+            $this->assignRulePath($root, explode('.', (string) $field), $schema, isset($requiredMap[$field]));
+        }
+
+        $compiled = $this->compileRuleNode($root);
+
         return [
-            'properties' => $properties,
-            'required' => array_values(array_unique($required)),
+            'properties' => $compiled['properties'] ?? [],
+            'required' => array_values($compiled['required'] ?? []),
         ];
+    }
+
+    /**
+     * @return array{properties: array<string, mixed>, items: ?array<string, mixed>, schema: ?array<string, mixed>, required: bool}
+     */
+    private function emptyRuleNode(): array
+    {
+        return [
+            'properties' => [],
+            'items' => null,
+            'schema' => null,
+            'required' => false,
+        ];
+    }
+
+    /**
+     * @param array{properties: array<string, mixed>, items: ?array<string, mixed>, schema: ?array<string, mixed>, required: bool} $node
+     * @param list<string> $segments
+     * @param array<string, mixed> $schema
+     */
+    private function assignRulePath(array &$node, array $segments, array $schema, bool $required): void
+    {
+        $segment = array_shift($segments);
+        if ($segment === null || $segment === '') {
+            return;
+        }
+
+        if ($segment === '*') {
+            if ($node['items'] === null) {
+                $node['items'] = $this->emptyRuleNode();
+            }
+            if ($segments === []) {
+                $node['items']['schema'] = $this->mergeRuleSchema($node['items']['schema'], $schema);
+
+                return;
+            }
+            $this->assignRulePath($node['items'], $segments, $schema, $required);
+
+            return;
+        }
+
+        if (! isset($node['properties'][$segment])) {
+            $node['properties'][$segment] = $this->emptyRuleNode();
+        }
+        if ($segments === []) {
+            $node['properties'][$segment]['schema'] = $this->mergeRuleSchema($node['properties'][$segment]['schema'], $schema);
+            $node['properties'][$segment]['required'] = $required || $node['properties'][$segment]['required'];
+
+            return;
+        }
+
+        $this->assignRulePath($node['properties'][$segment], $segments, $schema, $required);
+    }
+
+    /**
+     * @param array<string, mixed>|null $existing
+     * @param array<string, mixed> $schema
+     * @return array<string, mixed>
+     */
+    private function mergeRuleSchema(?array $existing, array $schema): array
+    {
+        if ($existing === null) {
+            return $schema;
+        }
+
+        return array_merge($existing, $schema);
+    }
+
+    /**
+     * @param array{properties: array<string, mixed>, items: ?array<string, mixed>, schema: ?array<string, mixed>, required: bool} $node
+     * @return array<string, mixed>
+     */
+    private function compileRuleNode(array $node): array
+    {
+        $schema = $node['schema'] ?? [];
+
+        if ($node['items'] !== null) {
+            $schema['type'] = 'array';
+            $schema['items'] = $this->compileRuleNode($node['items']);
+        }
+
+        if ($node['properties'] !== []) {
+            $properties = [];
+            $required = [];
+            foreach ($node['properties'] as $name => $child) {
+                $properties[$name] = $this->compileRuleNode($child);
+                if (! empty($child['required'])) {
+                    $required[] = $name;
+                }
+            }
+
+            if ($node['items'] !== null) {
+                $item = is_array($schema['items'] ?? null) ? $schema['items'] : [];
+                if (($item['type'] ?? '') !== 'object') {
+                    $item = ['type' => 'object'];
+                }
+                $item['properties'] = array_merge($item['properties'] ?? [], $properties);
+                if ($required !== []) {
+                    $item['required'] = array_values(array_unique(array_merge($item['required'] ?? [], $required)));
+                }
+                $schema['items'] = $item;
+            } else {
+                $schema['type'] = 'object';
+                unset($schema['items'], $schema['minItems'], $schema['maxItems']);
+                $schema['properties'] = $properties;
+                if ($required !== []) {
+                    $schema['required'] = $required;
+                }
+            }
+        }
+
+        if ($schema === []) {
+            return ['type' => 'string'];
+        }
+
+        return $schema;
     }
 
 
@@ -526,7 +662,7 @@ final class SchemaInferrer
             return [];
         }
         $body = $m[1];
-        if (! preg_match_all("/['\"]([A-Za-z0-9_.]+)['\"]/", $body, $keys)) {
+        if (! preg_match_all("/['\"]([A-Za-z0-9_.*]+)['\"]/", $body, $keys)) {
             return [];
         }
 
@@ -542,7 +678,7 @@ final class SchemaInferrer
 
         // 'field' => 'required|string|max:100'
         if (preg_match_all(
-            "/['\"]([A-Za-z0-9_.]+)['\"]\s*=>\s*['\"]([^'\"]*)['\"]/",
+            "/['\"]([A-Za-z0-9_.*]+)['\"]\s*=>\s*['\"]([^'\"]*)['\"]/",
             $body,
             $matches,
             PREG_SET_ORDER
@@ -554,7 +690,7 @@ final class SchemaInferrer
 
         // 'field' => ['required', 'string', 'max:100']
         if (preg_match_all(
-            "/['\"]([A-Za-z0-9_.]+)['\"]\s*=>\s*\[(.*?)\]/s",
+            "/['\"]([A-Za-z0-9_.*]+)['\"]\s*=>\s*\[(.*?)\]/s",
             $body,
             $matches,
             PREG_SET_ORDER
@@ -590,7 +726,7 @@ final class SchemaInferrer
             return [];
         }
         $properties = [];
-        if (preg_match_all("/['\"]([A-Za-z0-9_.]+)['\"]\s*=>/", $ret[1], $keys)) {
+        if (preg_match_all("/['\"]([A-Za-z0-9_.*]+)['\"]\s*=>/", $ret[1], $keys)) {
             foreach ($keys[1] as $field) {
                 $properties[$field] = ['type' => 'string', 'description' => $field];
             }
@@ -808,6 +944,8 @@ final class SchemaInferrer
         $parts = array_map('trim', explode('|', strtolower($rules)));
         $schema = ['type' => 'string'];
         $nullable = false;
+        $min = null;
+        $max = null;
 
         foreach ($parts as $part) {
             if ($part === 'nullable') {
@@ -859,18 +997,34 @@ final class SchemaInferrer
                     );
                 }
             } elseif (str_starts_with($part, 'max:')) {
-                $n = (int) substr($part, 4);
-                if (($schema['type'] ?? '') === 'string') {
-                    $schema['maxLength'] = $n;
-                } else {
-                    $schema['maximum'] = $n;
-                }
+                $max = (int) substr($part, 4);
             } elseif (str_starts_with($part, 'min:')) {
-                $n = (int) substr($part, 4);
-                if (($schema['type'] ?? '') === 'string') {
-                    $schema['minLength'] = $n;
-                } else {
-                    $schema['minimum'] = $n;
+                $min = (int) substr($part, 4);
+            }
+        }
+
+        if ($min !== null || $max !== null) {
+            $type = (string) ($schema['type'] ?? 'string');
+            if ($type === 'string') {
+                if ($min !== null) {
+                    $schema['minLength'] = $min;
+                }
+                if ($max !== null) {
+                    $schema['maxLength'] = $max;
+                }
+            } elseif ($type === 'array') {
+                if ($min !== null) {
+                    $schema['minItems'] = $min;
+                }
+                if ($max !== null) {
+                    $schema['maxItems'] = $max;
+                }
+            } else {
+                if ($min !== null) {
+                    $schema['minimum'] = $min;
+                }
+                if ($max !== null) {
+                    $schema['maximum'] = $max;
                 }
             }
         }
