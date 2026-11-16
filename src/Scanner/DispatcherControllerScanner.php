@@ -1116,6 +1116,7 @@ final class DispatcherControllerScanner
 
     private function actionSegment(string $method): string
     {
-        return strtolower(preg_replace('/([a-z])([A-Z])/', '$1-$2', $method) ?? $method);
+        // 与 resource snake 风格一致：unBind → un_bind（运行时 -/_ 均可，文档统一下划线）
+        return Str::snake($method);
     }
 }
