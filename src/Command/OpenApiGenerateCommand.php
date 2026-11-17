@@ -9,6 +9,7 @@ use Hyperf\Command\Command as HyperfCommand;
 use Hyperf\Context\ApplicationContext;
 use Hyperf\Contract\ConfigInterface;
 use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
 use Throwable;
 
 /**
@@ -32,6 +33,20 @@ class OpenApiGenerateCommand extends HyperfCommand
         $this->setDescription('按 API 版本扫描 Controller 生成 OpenAPI 3（可导入 Apifox）');
         // 不能用 --version / -V：会被 Application 当成「打印框架版本」吃掉
         $this->addOption('api-version', 'A', InputOption::VALUE_REQUIRED, '只生成指定 API 版本，如 v1；省略则生成全部');
+    }
+
+    /**
+     * Hyperf 3.1.x 的 parseVerbosity(null) 在 PHP 8.5 会触发
+     * “Using null as an array offset is deprecated”，且 ErrorExceptionHandler 会直接中断命令。
+     * 未显式传级别时改为整数 VERBOSITY_NORMAL，绕开 null 下标。
+     *
+     * @param string $string
+     * @param null|string $style
+     * @param null|int|string $verbosity
+     */
+    public function line($string, $style = null, $verbosity = null)
+    {
+        parent::line($string, $style, $verbosity ?? OutputInterface::VERBOSITY_NORMAL);
     }
 
     public function handle()
