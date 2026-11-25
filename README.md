@@ -62,7 +62,7 @@ $apiDispatcher = is_file(__DIR__ . '/api_dispatcher.php') ? require __DIR__ . '/
         'prefix' => '/api',
         'namespace' => 'App\\Controller\\Api',
         'path' => BASE_PATH . '/app/Controller/Api',
-        'folder' => 'Api',   // Apifox 目录：v1/Api
+        'folder' => 'Api',   // Apifox 目录：v1/Api；也用于 common_headers.groups 匹配
     ],
     [
         'prefix' => '/api/admin',
@@ -71,7 +71,27 @@ $apiDispatcher = is_file(__DIR__ . '/api_dispatcher.php') ? require __DIR__ . '/
         'folder' => 'Admin', // Apifox 目录：v1/Admin
     ],
 ],
+
+// 公共 header：shared 全网关；groups key = gateways[].folder
+'common_headers' => [
+    'shared' => [
+        'Authorization' => ['description' => 'Bearer 访问令牌', 'required' => false, 'type' => 'string'],
+        'X-API-Version' => ['description' => 'API 版本', 'required' => true, 'type' => 'string'],
+    ],
+    'groups' => [
+        'Api' => [
+            'X-Tenant-Id' => ['description' => '租户ID', 'required' => false, 'type' => 'integer'],
+            'X-Company-Id' => ['description' => '公司ID', 'required' => false, 'type' => 'integer'],
+            'X-User-Id' => ['description' => '用户ID', 'required' => false, 'type' => 'integer'],
+        ],
+        'Admin' => [
+            // Admin 专用头；与 Api 不同的写这里
+        ],
+    ],
+],
 ```
+
+旧扁平 `common_headers`（无 `shared`/`groups`）仍兼容，视为全部进 `shared`。
 
 目录结构（`x-apifox-folder`）：`v1/Api`、`v1/Admin`、`v2/Api`…  
 一次导入全量用 `storage/openapi/openapi.json`。

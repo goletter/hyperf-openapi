@@ -83,15 +83,31 @@ return [
         ],
     ],
 
-    // 所有接口统一的公共 header 入参：components.parameters 定义一次，每个 operation 以 $ref 引用；
-    // required 可按需切换（true 时文档侧必填，运行时由网关/中间件另行校验）。
+    /**
+     * 公共 header：components.parameters 定义一次，operation 按网关引用。
+     *
+     * - shared：所有网关都带
+     * - groups：key 与 gateways[].folder 对齐（如 Api / Admin）
+     *
+     * 旧扁平写法 ['X-Tenant-Id' => [...], ...] 仍兼容，视为全部进 shared。
+     */
     'common_headers' => [
-        'X-Tenant-Id' => ['description' => '租户ID', 'required' => false, 'type' => 'integer'],
-        'X-Company-Id' => ['description' => '公司ID', 'required' => false, 'type' => 'integer'],
-        'X-User-Id' => ['description' => '用户ID', 'required' => false, 'type' => 'integer'],
-        'Authorization' => ['description' => 'Bearer 访问令牌', 'required' => false, 'type' => 'string'],
-        // 分版本文档按当前文件版本写死 enum/default/example（如 v1）；此处仅作未分版本时的兜底描述。
-        'X-API-Version' => ['description' => 'API 版本（分版本文档导出时写死为该文件版本）', 'required' => true, 'type' => 'string'],
+        'shared' => [
+            'Authorization' => ['description' => 'Bearer 访问令牌', 'required' => false, 'type' => 'string'],
+            // 分版本文档按当前文件版本写死 enum/default/example（如 v1）
+            'X-API-Version' => ['description' => 'API 版本（分版本文档导出时写死为该文件版本）', 'required' => true, 'type' => 'string'],
+        ],
+        'groups' => [
+            'Api' => [
+                'X-Tenant-Id' => ['description' => '租户ID', 'required' => false, 'type' => 'integer'],
+                'X-Company-Id' => ['description' => '公司ID', 'required' => false, 'type' => 'integer'],
+                'X-User-Id' => ['description' => '用户ID', 'required' => false, 'type' => 'integer'],
+            ],
+            'Admin' => [
+                // Admin 与 Api 不同的头写在这里；不需要的头不要放进 shared
+                // 'X-Admin-Id' => ['description' => '管理员ID', 'required' => false, 'type' => 'integer'],
+            ],
+        ],
     ],
 
     'security' => [],

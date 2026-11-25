@@ -456,14 +456,20 @@ final class OpenApiGenerator
      */
     private function buildDocument(array $operations, ?string $version): array
     {
-        $commonParams = $this->buildCommonHeaderComponents($version);
-        $commonRefs = $this->commonHeaderParameterRefs(array_keys($commonParams));
+        $headerGroups = $this->resolveCommonHeaderGroups();
+        $commonParams = $this->buildCommonHeaderComponents($version, $headerGroups);
+        $allCommonNames = array_keys($commonParams);
 
         $paths = [];
         foreach ($operations as $op) {
             $path = (string) $op['path'];
             $method = strtolower((string) $op['method']);
             $paths[$path] ??= [];
+            $headerNames = $this->headerNamesForGateway(
+                (string) ($op['gateway_folder'] ?? ''),
+                $headerGroups
+            );
+            $commonRefs = $this->commonHeaderParameterRefs($headerNames);
             $item = [
                 'tags' => $op['tags'],
                 'summary' => $op['summary'],
@@ -471,7 +477,7 @@ final class OpenApiGenerator
                 'operationId' => $op['operationId'],
                 'parameters' => array_merge(
                     $commonRefs,
-                    $this->stripDuplicateCommonHeaders((array) ($op['parameters'] ?? []), array_keys($commonParams))
+                    $this->stripDuplicateCommonHeaders((array) ($op['parameters'] ?? []), $allCommonNames)
                 ),
             ];
             // Apifox 目录：v1/Api、v1/Admin（优先于 tags）
@@ -527,19 +533,102 @@ final class OpenApiGenerator
     }
 
     /**
-     * common_headers → components.parameters；分版本文档将 X-API-Version 写死为当前版本。
+     * 解析 common_headers：
+     * - 新格式：['shared' => [...], 'groups' => ['Api' => [...], 'Admin' => [...]]]
+     * - 旧扁平：['X-Tenant-Id' => [...], ...] 视为全部进 shared（兼容）
      *
+     * @return array{shared: array<string, array<string, mixed>>, groups: array<string, array<string, array<string, mixed>>>}
+     */
+    private function resolveCommonHeaderGroups(): array
+    {
+        $raw = (array) $this->config->get('openapi.common_headers', []);
+        if ($raw === []) {
+            return ['shared' => [], 'groups' => []];
+        }
+
+        $isGrouped = (isset($raw['shared']) && is_array($raw['shared']))
+            || (isset($raw['groups']) && is_array($raw['groups']));
+
+        if (! $isGrouped) {
+            return [
+                'shared' => $this->filterHeaderMap($raw),
+                'groups' => [],
+            ];
+        }
+
+        $groups = [];
+        foreach ((array) ($raw['groups'] ?? []) as $folder => $headers) {
+            if (! is_string($folder) || $folder === '' || ! is_array($headers)) {
+                continue;
+            }
+            $groups[$folder] = $this->filterHeaderMap($headers);
+        }
+
+        return [
+            'shared' => $this->filterHeaderMap((array) ($raw['shared'] ?? [])),
+            'groups' => $groups,
+        ];
+    }
+
+    /**
+     * @param array<mixed, mixed> $headers
      * @return array<string, array<string, mixed>>
      */
-    private function buildCommonHeaderComponents(?string $version): array
+    private function filterHeaderMap(array $headers): array
     {
-        $headers = (array) $this->config->get('openapi.common_headers', []);
-        if ($headers === []) {
+        $out = [];
+        foreach ($headers as $name => $meta) {
+            if (! is_string($name) || $name === '' || ! is_array($meta)) {
+                continue;
+            }
+            // 避免把 groups/shared 误当 header 名（扁平兼容路径不会走到这里的嵌套）
+            if ($name === 'shared' || $name === 'groups') {
+                continue;
+            }
+            $out[$name] = $meta;
+        }
+
+        return $out;
+    }
+
+    /**
+     * @param array{shared: array<string, array<string, mixed>>, groups: array<string, array<string, array<string, mixed>>>} $headerGroups
+     * @return list<string>
+     */
+    private function headerNamesForGateway(string $gatewayFolder, array $headerGroups): array
+    {
+        $names = array_keys($headerGroups['shared']);
+        if ($gatewayFolder !== '' && isset($headerGroups['groups'][$gatewayFolder])) {
+            foreach (array_keys($headerGroups['groups'][$gatewayFolder]) as $name) {
+                $names[] = $name;
+            }
+        }
+
+        return array_values(array_unique($names));
+    }
+
+    /**
+     * common_headers → components.parameters；分版本文档将 X-API-Version 写死为当前版本。
+     *
+     * @param array{shared: array<string, array<string, mixed>>, groups: array<string, array<string, array<string, mixed>>>} $headerGroups
+     * @return array<string, array<string, mixed>>
+     */
+    private function buildCommonHeaderComponents(?string $version, array $headerGroups): array
+    {
+        $merged = $headerGroups['shared'];
+        foreach ($headerGroups['groups'] as $headers) {
+            foreach ($headers as $name => $meta) {
+                if (! isset($merged[$name])) {
+                    $merged[$name] = $meta;
+                }
+            }
+        }
+        if ($merged === []) {
             return [];
         }
 
         $parameters = [];
-        foreach ($headers as $name => $meta) {
+        foreach ($merged as $name => $meta) {
             if (! is_string($name) || $name === '' || ! is_array($meta)) {
                 continue;
             }

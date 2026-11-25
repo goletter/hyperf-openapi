@@ -125,6 +125,7 @@ final class DispatcherControllerScanner
                         $prefix,
                         $resourceSeg,
                         $tag,
+                        $folder,
                         $apifoxFolder,
                         $classDoc,
                         $meta,
@@ -612,6 +613,7 @@ final class DispatcherControllerScanner
         string $prefix,
         string $resourceSeg,
         string $tag,
+        string $gatewayFolder,
         string $apifoxFolder,
         array $classDoc,
         array $meta,
@@ -648,7 +650,7 @@ final class DispatcherControllerScanner
             }
         }
 
-        // 公共 header（X-API-Version 等）由 OpenApiGenerator 按 common_headers 以 $ref 注入
+        // 公共 header 由 OpenApiGenerator 按 common_headers（shared + groups[gateway_folder]）以 $ref 注入
         $parameters = [];
         if (str_contains($path, '{id}')) {
             $parameters[] = [
@@ -795,6 +797,7 @@ final class DispatcherControllerScanner
             // tags：给 HTML/Swagger 分组用，不要带 /（会被拆成空的父级目录）
             // x-apifox-folder：Apifox 客户端真正的多级目录
             'tags' => [$this->ensureUtf8($version . ' · ' . $tag)],
+            'gateway_folder' => $gatewayFolder,
             'x-apifox-folder' => $apifoxFolder,
             'parameters' => $parameters,
             'requestBody' => $requestBody,
